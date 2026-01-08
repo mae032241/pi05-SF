@@ -119,7 +119,8 @@ def preprocess_observation_pytorch(
                     ).permute(0, 2, 3, 1)  # [b, c, h, w] -> [b, h, w, c]
 
             # Save original images (with color_aug, but without rotation) for VGGT input
-            img_inv_padding = image_tools.replace_padding_0to1_torch(image)
+            img_inv_padding = image.clone() if not (image == 0).all() else torch.ones_like(image)
+            img_inv_padding[~observation.image_padding_mask[key]] = 1.0  # Set padding areas to white
             img_inv_padding = img_inv_padding.permute(0, 3, 1, 2) if is_channels_first else img_inv_padding
             out_images_wo_aug[key] = img_inv_padding.contiguous()
 
@@ -162,6 +163,9 @@ def preprocess_observation_pytorch(
             out_masks[key] = torch.ones(batch_shape, dtype=torch.bool, device=observation.state.device)
         else:
             out_masks[key] = observation.image_masks[key]
+  
+    # obtain image padding mask for non-rectangular images
+    img_padding_mask = {key: observation.image_padding_mask[key] for key in out_images}       
 
     # Create a simple object with the required attributes instead of using the complex Observation class
     class SimpleProcessedObservation:
@@ -171,6 +175,7 @@ def preprocess_observation_pytorch(
 
     result_kwargs = {
         "images": out_images,
+        "image_padding_mask": img_padding_mask,
         "image_masks": out_masks,
         "state": observation.state,
         "tokenized_prompt": observation.tokenized_prompt,

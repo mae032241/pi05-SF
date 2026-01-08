@@ -469,8 +469,9 @@ def train_loop(config: _config.TrainConfig):
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
     if config.vggt_weight_path is not None:
-        logging.info(f"Loading VGGT weights from: {config.vggt_weight_path}")
         vggt_path = os.path.join(config.vggt_weight_path, "model.pt")
+        if not os.path.exists(vggt_path):
+            raise FileNotFoundError(f"VGGT weight file not found at {vggt_path}")
         vggt_model.load_state_dict(torch.load(vggt_path), strict=False)
         logging.info(f"Loaded VGGT weights from {config.vggt_weight_path}")
 

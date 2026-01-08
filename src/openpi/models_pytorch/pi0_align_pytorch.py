@@ -175,6 +175,7 @@ class PI0Pytorch(nn.Module):
         return (
             list(observation.images.values()),
             list(observation.img_wo_aug.values()) if get_wo_aug else None,
+            list(observation.image_padding_mask.values()),
             list(observation.image_masks.values()),
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
@@ -329,7 +330,7 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, vggt, align_proj, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_wo_aug, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+        images, img_wo_aug, img_padding_mask, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
             observation, train=True, get_wo_aug=True
         )
         img_resize_wo_aug = preprocess_images_from_openpi(img_wo_aug)  # specific for VGGT with 518px input
@@ -420,6 +421,18 @@ class PI0Pytorch(nn.Module):
         img_masks_stack = torch.stack(img_masks, dim=1)
         align_mask = torch.repeat_interleave(img_masks_stack, repeats=tokens_per_img, dim=1)
 
+        # useless non-rectangular image padding feature masks for alignment loss
+        img_padding_mask = torch.stack(img_padding_mask, dim=1)
+        target_size = img_padding_mask.shape[-1] // 14  # 224/14, where 14 is the patch size of Gemma encoder
+        mask_downsampled = F.interpolate(
+            img_padding_mask.float(), 
+            size=(target_size, target_size), 
+            mode='nearest'
+        ).bool().flatten(start_dim=1)
+        assert align_mask.shape == mask_downsampled.shape, \
+            "align_mask shape don't match img_padding_mask shape, please manually modify the patch size of Gemma encoder (now is 14)"
+        align_mask = mask_downsampled & align_mask
+
         # calculate align loss
         with torch.autocast("cuda", dtype=torch.bfloat16):
             align_loss = align_proj(vision_hidden, vggt_hidden, align_mask)
@@ -434,7 +447,7 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, _, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, _, _, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks, _ = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
