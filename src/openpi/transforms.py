@@ -189,12 +189,16 @@ class ResizeImages(DataTransformFn):
     def __call__(self, data: DataDict) -> DataDict:
         data["image_padding_mask"] = dict()
         for cam in data["image"]:
+<<<<<<< HEAD
             resized_img, img_padding_mask = image_tools.resize_with_pad(
                 data["image"][cam], 
                 self.height, 
                 self.width,
                 return_mask=True
             )
+=======
+            resized_img, img_padding_mask = image_tools.resize_with_pad(data["image"][cam], self.height, self.width)
+>>>>>>> 91f9eafcc4322e81a2744c3eb00904cc359aeccb
             data["image"][cam] = resized_img
             data["image_padding_mask"][cam] = img_padding_mask
         return data
