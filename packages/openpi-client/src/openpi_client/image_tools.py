@@ -42,7 +42,6 @@ def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BI
     resized_images = np.stack(resized_images)
     img_padding_mask = np.stack(img_padding_mask)
 
-<<<<<<< HEAD
     if return_mask:
         return (
             resized_images.reshape(*original_shape[:-3], *resized_images.shape[-3:]), 
@@ -50,12 +49,6 @@ def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BI
         )
     else:
         return resized_images.reshape(*original_shape[:-3], *resized_images.shape[-3:])
-=======
-    return (
-        resized_images.reshape(*original_shape[:-3], *resized_images.shape[-3:]), 
-        img_padding_mask.reshape(*original_shape[:-3], *img_padding_mask.shape[-2:]),
-    )
->>>>>>> 91f9eafcc4322e81a2744c3eb00904cc359aeccb
 
 
 def _resize_with_pad_pil(image: Image.Image, height: int, width: int, method: int) -> Image.Image:
