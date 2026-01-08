@@ -89,6 +89,8 @@ class Observation(Generic[ArrayT]):
 
     # Images, in [-1, 1] float32.
     images: dict[str, at.Float[ArrayT, "*b h w c"]]
+    # the padding area for non-rectangular input images is False
+    image_padding_mask: dict[str, at.Bool[ArrayT, "*b w c"]]
     # Image masks, with same keys as images.
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
     # Low-dimensional robot state.
@@ -120,6 +122,7 @@ class Observation(Generic[ArrayT]):
                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
+            image_padding_mask=data.get("image_padding_mask", {}),
             image_masks=data["image_mask"],
             state=data["state"],
             tokenized_prompt=data.get("tokenized_prompt"),

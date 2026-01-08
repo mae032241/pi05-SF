@@ -12,7 +12,7 @@ def convert_to_uint8(img: np.ndarray) -> np.ndarray:
     return img
 
 
-def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BILINEAR) -> np.ndarray:
+def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BILINEAR, return_mask=False) -> np.ndarray:
     """Replicates tf.image.resize_with_pad for multiple images using PIL. Resizes a batch of images to a target height.
 
     Args:
@@ -26,13 +26,29 @@ def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BI
     """
     # If the images are already the correct size, return them as is.
     if images.shape[-3:-1] == (height, width):
+        if return_mask:
+            img_padding_mask = np.ones((*images.shape[:-3], height, width), dtype=bool)
+            return images, img_padding_mask
         return images
 
     original_shape = images.shape
 
     images = images.reshape(-1, *original_shape[-3:])
-    resized = np.stack([_resize_with_pad_pil(Image.fromarray(im), height, width, method=method) for im in images])
-    return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
+
+    resized_results = [
+        _resize_with_pad_pil(Image.fromarray(im), height, width, method=method) for im in images
+    ]
+    resized_images, img_padding_mask = zip(*resized_results)
+    resized_images = np.stack(resized_images)
+    img_padding_mask = np.stack(img_padding_mask)
+
+    if return_mask:
+        return (
+            resized_images.reshape(*original_shape[:-3], *resized_images.shape[-3:]), 
+            img_padding_mask.reshape(*original_shape[:-3], *img_padding_mask.shape[-2:]),
+        )
+    else:
+        return resized_images.reshape(*original_shape[:-3], *resized_images.shape[-3:])
 
 
 def _resize_with_pad_pil(image: Image.Image, height: int, width: int, method: int) -> Image.Image:
@@ -55,4 +71,8 @@ def _resize_with_pad_pil(image: Image.Image, height: int, width: int, method: in
     pad_width = max(0, int((width - resized_width) / 2))
     zero_image.paste(resized_image, (pad_width, pad_height))
     assert zero_image.size == (width, height)
-    return zero_image
+
+    img_padding_mask = np.zeros((height, width), dtype=bool)
+    img_padding_mask[pad_height:pad_height+resized_height, pad_width:pad_width+resized_width] = True
+
+    return zero_image, img_padding_mask
