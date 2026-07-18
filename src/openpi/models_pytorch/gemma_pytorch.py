@@ -8,6 +8,8 @@ from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+from openpi.models_pytorch import lora_pytorch
+
 
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
@@ -16,6 +18,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         action_expert_config,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        vision_lora_config=None,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -57,6 +60,15 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
+        # The JAX action expert has neither a token embedding nor an LM head.
+        # PI0 calls gemma_expert.model directly, so keeping this unused head
+        # adds 257152 * expert_width parameters and breaks trainable parity.
+        self.gemma_expert.lm_head = None
+
+        lora_pytorch.inject_gemma_lora(self.paligemma.language_model, vlm_config)
+        lora_pytorch.inject_gemma_lora(self.gemma_expert.model, action_expert_config)
+        if vision_lora_config is not None:
+            lora_pytorch.inject_siglip_lora(self.paligemma, vision_lora_config)
 
         self.to_bfloat16_for_selected_params(precision)
 
@@ -79,7 +91,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         ]
 
         for name, param in self.named_parameters():
-            if any(selector in name for selector in params_to_keep_float32):
+            if "lora_" in name or any(selector in name for selector in params_to_keep_float32):
                 param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor):
@@ -287,5 +299,5 @@ class PaliGemmaWithExpertModel(nn.Module):
 
         if output_hidden_states:
             return [prefix_output, suffix_output], prefix_past_key_values, all_hidden_states
-        
+
         return [prefix_output, suffix_output], prefix_past_key_values

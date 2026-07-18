@@ -472,6 +472,19 @@ class TrainConfig:
 
     # Optional path to a PyTorch checkpoint to load weights from.
     pytorch_weight_path: str | None = None
+    # Load the PyTorch base model directly from a local JAX Orbax checkpoint
+    # instead of requiring an intermediate model.safetensors conversion.
+    pytorch_load_from_jax: bool = False
+    # Optional explicit JAX checkpoint root or params/ path. When omitted, the
+    # path from CheckpointWeightLoader is reused.
+    pytorch_jax_weight_path: str | None = None
+
+    # If true, JAX and PyTorch checkpoints save only trainable parameters and
+    # merge them with their respective base checkpoint on resume/inference.
+    lora_save: bool = False
+    # Optional explicit base params path recorded in adapter metadata. When
+    # omitted, CheckpointWeightLoader.params_path is used.
+    lora_base_params_path: str | None = None
 
     # Spatial Forcing configs
     vggt_weight_path: str | None = None
@@ -495,6 +508,9 @@ class TrainConfig:
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
+    # Derive the freeze filter from the final model config, including CLI model
+    # overrides such as vision_train_mode.
+    auto_freeze_filter: tyro.conf.Suppress[bool] = False
 
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
@@ -556,8 +572,40 @@ class TrainConfig:
         return nnx.All(nnx.Param, nnx.Not(self.freeze_filter))
 
     def __post_init__(self) -> None:
+        if self.auto_freeze_filter:
+            if not isinstance(self.model, pi0_config.Pi0Config):
+                raise ValueError("auto_freeze_filter requires Pi0Config")
+            object.__setattr__(self, "freeze_filter", self.model.get_freeze_filter())
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.lora_save:
+            if self.ema_decay is not None:
+                raise ValueError("lora_save currently requires ema_decay=None")
+            if self.lora_base_params_path is None and not isinstance(
+                self.weight_loader, weight_loaders.CheckpointWeightLoader
+            ):
+                raise ValueError("lora_save requires lora_base_params_path or CheckpointWeightLoader")
+        if self.pytorch_load_from_jax:
+            if self.pytorch_weight_path is not None:
+                raise ValueError("pytorch_load_from_jax and pytorch_weight_path are mutually exclusive")
+            if self.resolved_pytorch_jax_weight_path is None:
+                raise ValueError("pytorch_load_from_jax requires pytorch_jax_weight_path or CheckpointWeightLoader")
+
+    @property
+    def resolved_lora_base_params_path(self) -> str | None:
+        if self.lora_base_params_path is not None:
+            return self.lora_base_params_path
+        if isinstance(self.weight_loader, weight_loaders.CheckpointWeightLoader):
+            return self.weight_loader.params_path
+        return None
+
+    @property
+    def resolved_pytorch_jax_weight_path(self) -> str | None:
+        if self.pytorch_jax_weight_path is not None:
+            return self.pytorch_jax_weight_path
+        if isinstance(self.weight_loader, weight_loaders.CheckpointWeightLoader):
+            return self.weight_loader.params_path
+        return None
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -868,6 +916,100 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
         batch_size=64,
+    ),
+    TrainConfig(
+        name="pi05_robotwin_place_dual_shoes_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            vision_train_mode="lora",
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="place_dual_shoes_clean_50",
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        auto_freeze_filter=True,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/autodl-tmp/data/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        ema_decay=None,
+        lora_save=True,
+        batch_size=1,
+        num_train_steps=30_000,
+        save_interval=5_000,
+        keep_period=None,
+        wandb_enabled=False,
+        fsdp_devices=1,
+    ),
+    TrainConfig(
+        name="pi05_robotwin_place_dual_shoes_lora_torch_sf",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            vision_train_mode="lora",
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="place_dual_shoes_clean_50",
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        auto_freeze_filter=True,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/autodl-tmp/data/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        # Load the existing local JAX base directly without writing a converted copy.
+        pytorch_weight_path=None,
+        pytorch_load_from_jax=True,
+        vggt_weight_path="./checkpoints/vggt",
+        vla_layers_align=12,
+        vggt_layers_align=-1,
+        pooling_func="bilinear",
+        use_vggt_pe=True,
+        use_vlm_norm=True,
+        align_loss_coeff=0.5,
+        ema_decay=None,
+        lora_save=True,
+        batch_size=1,
+        num_train_steps=30_000,
+        save_interval=5_000,
+        keep_period=None,
+        wandb_enabled=False,
+        fsdp_devices=1,
     ),
     #
     # Fine-tuning DROID configs.

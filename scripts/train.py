@@ -116,7 +116,7 @@ def init_train_state(
     train_state_shape = jax.eval_shape(init, init_rng)
     state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
 
-    if resume:
+    if resume and not config.lora_save:
         return train_state_shape, state_sharding
 
     partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
@@ -238,7 +238,12 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = _checkpoints.restore_state(
+            checkpoint_manager,
+            train_state,
+            data_loader,
+            trainable_filter=config.trainable_filter if config.lora_save else None,
+        )
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -270,7 +275,22 @@ def main(config: _config.TrainConfig):
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            adapter_metadata = None
+            if config.lora_save:
+                adapter_metadata = {
+                    "format": "openpi_trainable_adapter_v1",
+                    "base_params_path": config.resolved_lora_base_params_path,
+                    "train_config_name": config.name,
+                    "vision_train_mode": getattr(config.model, "vision_train_mode", None),
+                }
+            _checkpoints.save_state(
+                checkpoint_manager,
+                train_state,
+                data_loader,
+                step,
+                trainable_filter=config.trainable_filter if config.lora_save else None,
+                adapter_metadata=adapter_metadata,
+            )
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

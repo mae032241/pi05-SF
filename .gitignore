@@ -130,6 +130,15 @@ celerybeat.pid
 # Environments
 .env
 .venv
+
+# Optional local source copies used during offline development.
+/third_party/lerobot/
+/third_party/dlimp/
+
+# Local RoboTwin runtime files.
+/logs/
+/robotwin_place_dual_shoes.env
+/uv.lock
 env/
 venv/
 ENV/

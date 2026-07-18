@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as futures
 import dataclasses
+import json
 import logging
-from typing import Protocol
+from typing import Any, Protocol
 
 from etils import epath
 import jax
@@ -67,6 +68,9 @@ def save_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    *,
+    trainable_filter=None,
+    adapter_metadata: dict[str, Any] | None = None,
 ):
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
@@ -74,10 +78,21 @@ def save_state(
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
             _normalize.save(directory / data_config.asset_id, norm_stats)
+        if adapter_metadata is not None:
+            (directory / "adapter_metadata.json").write_text(json.dumps(adapter_metadata, indent=2))
 
-    # Split params that can be used for inference into a separate item.
-    with at.disable_typechecking():
-        train_state, params = _split_params(state)
+    if adapter_metadata is None:
+        # Preserve the existing full-checkpoint behavior by default.
+        with at.disable_typechecking():
+            train_state, params = _split_params(state)
+    else:
+        if trainable_filter is None:
+            raise ValueError("trainable_filter is required for adapter checkpoints")
+        if state.ema_params is not None:
+            raise ValueError("Adapter checkpoints do not support EMA params")
+        with at.disable_typechecking():
+            train_state = dataclasses.replace(state, params={})
+            params = state.params.filter(trainable_filter)
     items = {
         "assets": save_assets,
         "train_state": train_state,
@@ -91,12 +106,20 @@ def restore_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int | None = None,
+    *,
+    trainable_filter=None,
 ) -> training_utils.TrainState:
     del data_loader
 
     with at.disable_typechecking():
-        # Split params that can be used for inference into a separate item.
-        train_state, params = _split_params(state)
+        if trainable_filter is None:
+            # Split params that can be used for inference into a separate item.
+            train_state, params = _split_params(state)
+        else:
+            if state.ema_params is not None:
+                raise ValueError("Adapter checkpoints do not support EMA params")
+            train_state = dataclasses.replace(state, params={})
+            params = state.params.filter(trainable_filter)
         restored = checkpoint_manager.restore(
             step,
             items={
@@ -104,7 +127,14 @@ def restore_state(
                 "params": {"params": params},
             },
         )
-    return _merge_params(restored["train_state"], restored["params"])
+    if trainable_filter is None:
+        return _merge_params(restored["train_state"], restored["params"])
+
+    adapter_params = restored["params"]["params"]
+    adapter_dict = adapter_params.to_pure_dict() if hasattr(adapter_params, "to_pure_dict") else adapter_params
+    full_params = state.params
+    full_params.replace_by_pure_dict(adapter_dict)
+    return dataclasses.replace(restored["train_state"], params=full_params)
 
 
 def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:

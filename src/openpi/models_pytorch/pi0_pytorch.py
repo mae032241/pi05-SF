@@ -7,6 +7,8 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
+import openpi.models.lora as _lora
+from openpi.models_pytorch import lora_pytorch
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
@@ -95,6 +97,11 @@ class PI0Pytorch(nn.Module):
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
+            vision_lora_config=(
+                _lora.LoRAConfig(rank=config.vision_lora_rank, alpha=config.vision_lora_alpha)
+                if config.vision_train_mode == "lora"
+                else None
+            ),
         )
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
@@ -107,6 +114,8 @@ class PI0Pytorch(nn.Module):
             self.state_proj = nn.Linear(32, action_expert_config.width)
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+
+        lora_pytorch.configure_pi0_trainability(self, config)
 
         torch.set_float32_matmul_precision("high")
         self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")

@@ -26,6 +26,7 @@ Example:
     python examples/convert_jax_model_to_pytorch.py --checkpoint_dir /home/$USER/.cache/openpi/openpi-assets/checkpoints/pi05_droid --output_path /home/$USER/.cache/openpi/openpi-assets/checkpoints/pi05_droid_pytorch
 """
 
+import dataclasses
 import json
 import os
 import pathlib
@@ -290,7 +291,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
     llm_mlp_linear = state_dict.pop(f"llm/layers/mlp_{num_expert}/linear{suffix}")
 
     # Check if we have Dense layers (for pi05/adaptive normalization) or scale layers (for regular pi0)
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization
         llm_input_layernorm_bias = state_dict.pop(f"llm/layers/pre_attention_norm_{num_expert}/Dense_0/bias{suffix}")
         llm_post_attention_layernorm_bias = state_dict.pop(f"llm/layers/pre_ffw_norm_{num_expert}/Dense_0/bias{suffix}")
@@ -345,7 +346,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             i
         ].transpose()
 
-        if "pi05" in checkpoint_dir:
+        if pi05:
             # Pi05 with adaptive normalization - use Dense layer parameters directly
             state_dict[f"paligemma_with_expert.gemma_expert.model.layers.{i}.input_layernorm.dense.bias"] = (
                 llm_input_layernorm_bias[i]
@@ -369,7 +370,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             )
 
     # Handle final norm layer
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization - use Dense layer parameters directly
         final_norm_bias = state_dict.pop(f"llm/final_norm_{num_expert}/Dense_0/bias{suffix}")
         final_norm_kernel = state_dict.pop(f"llm/final_norm_{num_expert}/Dense_0/kernel{suffix}")
@@ -398,9 +399,12 @@ def slice_initial_orbax_checkpoint(checkpoint_dir: str, restore_precision: str |
     This respects dtype conversions that occur during model restore.
     """
     # Use repository restore utility to load a pure dict of params (value suffix removed)
-    params = openpi.models.model.restore_params(
-        f"{checkpoint_dir}/params/", restore_type=np.ndarray, dtype=restore_precision
-    )
+    if checkpoint_dir.startswith("gs://"):
+        params_path = checkpoint_dir if checkpoint_dir.rstrip("/").endswith("/params") else f"{checkpoint_dir}/params"
+    else:
+        checkpoint_path = pathlib.Path(checkpoint_dir)
+        params_path = checkpoint_path if checkpoint_path.name == "params" else checkpoint_path / "params"
+    params = openpi.models.model.restore_params(params_path, restore_type=np.ndarray, dtype=restore_precision)
 
     return {"paligemma_params": traversals.flatten_mapping(params["PaliGemma"], sep="/"), "projection_params": params}
 
@@ -510,8 +514,16 @@ def convert_pi0_checkpoint(
         expert_params, action_expert_config, num_expert=1, checkpoint_dir=checkpoint_dir, pi05=model_config.pi05
     )
 
-    # Instantiate model
-    pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_config)
+    # A released JAX base checkpoint does not contain adapters.  Even when the
+    # selected training config enables LoRA, convert a clean full base model;
+    # the Torch LoRA model will inject its adapters before loading this file.
+    base_model_config = dataclasses.replace(
+        model_config,
+        paligemma_variant=model_config.paligemma_variant.removesuffix("_lora"),
+        action_expert_variant=model_config.action_expert_variant.removesuffix("_lora"),
+        vision_train_mode="full",
+    )
+    pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(base_model_config)
 
     # Combine all parameters (no prefix needed for our model structure)
     all_params = {**paligemma_params, **gemma_params, **projection_params}
@@ -544,8 +556,8 @@ def convert_pi0_checkpoint(
     config_dict = {
         "action_dim": model_config.action_dim,
         "action_horizon": model_config.action_horizon,
-        "paligemma_variant": model_config.paligemma_variant,
-        "action_expert_variant": model_config.action_expert_variant,
+        "paligemma_variant": base_model_config.paligemma_variant,
+        "action_expert_variant": base_model_config.action_expert_variant,
         "precision": precision,
     }
     with open(os.path.join(output_path, "config.json"), "w") as f:

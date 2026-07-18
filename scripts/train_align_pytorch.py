@@ -25,6 +25,7 @@ Multi-Node Training:
 
 import dataclasses
 import gc
+import itertools
 import logging
 import os
 import platform
@@ -41,11 +42,14 @@ import tqdm
 import wandb
 
 import openpi.models.pi0_config
-from openpi.models_pytorch import pi0_pytorch, pi0_align_pytorch, projectors
+from openpi.models_pytorch import jax_weights_pytorch
+from openpi.models_pytorch import lora_pytorch
+from openpi.models_pytorch import pi0_align_pytorch
+from openpi.models_pytorch import projectors
 import openpi.shared.normalize as _normalize
+from openpi.training import checkpoints_pytorch
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
-
 from vggt.models.vggt import VGGT
 
 
@@ -148,7 +152,18 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(
+    model,
+    align_projector,
+    optimizer,
+    global_step,
+    config,
+    is_main,
+    data_config,
+    *,
+    base_model_path=None,
+    base_model_format=jax_weights_pytorch.PYTORCH_SAFETENSORS_BASE_FORMAT,
+):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
@@ -164,9 +179,40 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             shutil.rmtree(tmp_ckpt_dir)
         tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save model state using safetensors (handle shared tensors)
+        # Save model state and the independent alignment projector.
         model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        projector_to_save = (
+            align_projector.module
+            if isinstance(align_projector, torch.nn.parallel.DistributedDataParallel)
+            else align_projector
+        )
+        if config.lora_save:
+            base_model_path = base_model_path or (
+                config.resolved_pytorch_jax_weight_path
+                if config.pytorch_load_from_jax
+                else config.pytorch_weight_path
+            )
+            if base_model_path is None:
+                raise ValueError("PyTorch lora_save requires a full base model path")
+            checkpoints_pytorch.save_adapter_weights(
+                model_to_save,
+                tmp_ckpt_dir / checkpoints_pytorch.ADAPTER_FILENAME,
+            )
+            checkpoints_pytorch.write_adapter_metadata(
+                tmp_ckpt_dir,
+                {
+                    "format": checkpoints_pytorch.PYTORCH_ADAPTER_FORMAT,
+                    "base_model_path": checkpoints_pytorch.canonical_base_model_path(
+                        base_model_path, base_model_format
+                    ),
+                    "base_model_format": base_model_format,
+                    "train_config_name": config.name,
+                    "vision_train_mode": getattr(config.model, "vision_train_mode", None),
+                },
+            )
+        else:
+            safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / checkpoints_pytorch.FULL_MODEL_FILENAME)
+        safetensors.torch.save_model(projector_to_save, tmp_ckpt_dir / "align_projector.safetensors")
 
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
@@ -189,6 +235,14 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             shutil.rmtree(final_ckpt_dir)
         tmp_ckpt_dir.rename(final_ckpt_dir)
 
+        removed_steps = checkpoints_pytorch.prune_checkpoints(
+            config.checkpoint_dir,
+            latest_step=global_step,
+            keep_period=config.keep_period,
+        )
+        if removed_steps:
+            logging.info(f"Removed old checkpoints: {removed_steps}")
+
         logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
         # Log checkpoint to wandb
@@ -196,8 +250,8 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
-    """Load the latest checkpoint and return the global step."""
+def load_checkpoint(model, align_projector, optimizer, checkpoint_dir, device):
+    """Load the latest checkpoint and return its step and optional base path."""
     checkpoint_steps = [
         int(d.name)
         for d in checkpoint_dir.iterdir()
@@ -219,14 +273,27 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
     try:
         # Load model state with error handling
         logging.info("Loading model state...")
-        safetensors_path = ckpt_dir / "model.safetensors"
-
-        if safetensors_path.exists():
-            model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
-            logging.info("Loaded model state from safetensors format")
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        adapter_metadata = checkpoints_pytorch.read_adapter_metadata(ckpt_dir)
+        if adapter_metadata is not None:
+            checkpoints_pytorch.load_adapter_model_weights(model_to_load, ckpt_dir, device=device)
+            logging.info("Loaded base model and PyTorch adapter")
         else:
-            raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
+            safetensors_path = ckpt_dir / checkpoints_pytorch.FULL_MODEL_FILENAME
+            checkpoints_pytorch.load_full_weights(model_to_load, safetensors_path, device=device, strict=True)
+            logging.info("Loaded model state from safetensors format")
+
+        projector_to_load = (
+            align_projector.module
+            if isinstance(align_projector, torch.nn.parallel.DistributedDataParallel)
+            else align_projector
+        )
+        checkpoints_pytorch.load_full_weights(
+            projector_to_load,
+            ckpt_dir / "align_projector.safetensors",
+            device=device,
+            strict=True,
+        )
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -258,7 +325,16 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         log_memory_usage(device, latest_step, "after_loading_metadata")
 
         logging.info(f"Successfully loaded all checkpoint components from step {latest_step}")
-        return global_step
+        if adapter_metadata is None:
+            return global_step, None, None
+        return (
+            global_step,
+            adapter_metadata["base_model_path"],
+            adapter_metadata.get(
+                "base_model_format",
+                jax_weights_pytorch.PYTORCH_SAFETENSORS_BASE_FORMAT,
+            ),
+        )
 
     except RuntimeError as e:
         if "out of memory" in str(e):
@@ -309,6 +385,15 @@ def log_memory_usage(device, step, phase="unknown"):
 
 
 def train_loop(config: _config.TrainConfig):
+    if (
+        config.lora_save
+        and config.pytorch_weight_path is None
+        and not config.pytorch_load_from_jax
+        and not config.resume
+    ):
+        raise ValueError(
+            "PyTorch LoRA training requires pytorch_weight_path or pytorch_load_from_jax"
+        )
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
@@ -408,7 +493,7 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    model = openpi.models_pytorch.pi0_align_pytorch.PI0Pytorch(model_cfg, config).to(device)
+    model = pi0_align_pytorch.PI0Pytorch(model_cfg, config).to(device)
     vggt_model = VGGT(
         enable_camera=False,
         enable_point=False,
@@ -459,12 +544,19 @@ def train_loop(config: _config.TrainConfig):
         )
 
     # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
+    model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    if config.pytorch_load_from_jax and not resuming:
+        jax_weights_pytorch.load_jax_weights(
+            model_to_load,
+            config.resolved_pytorch_jax_weight_path,
+        )
+        logging.info(f"Loaded JAX weights from {config.resolved_pytorch_jax_weight_path}")
+    elif config.pytorch_weight_path is not None and not resuming:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), 
-            model_path,
+        checkpoints_pytorch.load_full_weights(
+            model_to_load,
+            config.pytorch_weight_path,
+            device=device,
             strict=False,
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
@@ -483,7 +575,7 @@ def train_loop(config: _config.TrainConfig):
 
     # Create optimizer with config parameters
     optim = torch.optim.AdamW(
-        list(model.parameters()) + list(align_projector.parameters()),
+        list(lora_pytorch.trainable_parameters(model)) + list(align_projector.parameters()),
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -492,8 +584,22 @@ def train_loop(config: _config.TrainConfig):
 
     # Load checkpoint if resuming
     global_step = 0
+    base_model_path = (
+        config.resolved_pytorch_jax_weight_path if config.pytorch_load_from_jax else config.pytorch_weight_path
+    )
+    base_model_format = (
+        jax_weights_pytorch.JAX_ORBAX_BASE_FORMAT
+        if config.pytorch_load_from_jax
+        else jax_weights_pytorch.PYTORCH_SAFETENSORS_BASE_FORMAT
+    )
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
+        global_step, resumed_base_model_path, resumed_base_model_format = load_checkpoint(
+            model, align_projector, optim, config.checkpoint_dir, device
+        )
+        base_model_path = resumed_base_model_path or base_model_path
+        base_model_format = resumed_base_model_format or base_model_format
+        if config.lora_save and base_model_path is None:
+            raise ValueError("Resumed checkpoint does not specify a PyTorch base model path")
         logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
@@ -566,7 +672,10 @@ def train_loop(config: _config.TrainConfig):
                 log_memory_usage(device, global_step, "after_backward")
 
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                itertools.chain(lora_pytorch.trainable_parameters(model), align_projector.parameters()),
+                max_norm=config.optimizer.clip_gradient_norm,
+            )
 
             # Optimizer step
             optim.step()
@@ -628,7 +737,17 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(
+                model,
+                align_projector,
+                optim,
+                global_step,
+                config,
+                is_main,
+                data_config,
+                base_model_path=base_model_path,
+                base_model_format=base_model_format,
+            )
 
             # Update progress bar
             if pbar is not None:

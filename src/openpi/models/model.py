@@ -14,12 +14,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
-import safetensors
 import torch
 
+from openpi.models_pytorch import jax_weights_pytorch
 from openpi.models_pytorch import pi0_pytorch
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
+from openpi.training import checkpoints_pytorch
 
 logger = logging.getLogger("openpi")
 
@@ -90,7 +91,7 @@ class Observation(Generic[ArrayT]):
     # Images, in [-1, 1] float32.
     images: dict[str, at.Float[ArrayT, "*b h w c"]]
     # the padding area for non-rectangular input images is False
-    image_padding_mask: dict[str, at.Bool[ArrayT, "*b w c"]]
+    image_padding_mask: dict[str, at.Bool[ArrayT, "*b h w"]]
     # Image masks, with same keys as images.
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
     # Low-dimensional robot state.
@@ -202,6 +203,7 @@ def preprocess_observation(
 
     return Observation(
         images=out_images,
+        image_padding_mask=observation.image_padding_mask,
         image_masks=out_masks,
         state=observation.state,
         tokenized_prompt=observation.tokenized_prompt,
@@ -246,7 +248,19 @@ class BaseModelConfig(abc.ABC):
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+        checkpoints_pytorch.load_full_weights(model, weight_path, strict=False)
+        return model
+
+    def load_pytorch_adapter(self, train_config, checkpoint_dir: pathlib.Path | str):
+        logger.info(f"Loading PyTorch adapter for train config: {train_config.name}")
+        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+        checkpoints_pytorch.load_adapter_model_weights(model, checkpoint_dir)
+        return model
+
+    def load_pytorch_from_jax(self, train_config, checkpoint_dir: pathlib.Path | str):
+        logger.info(f"Loading local JAX base directly into PyTorch for config: {train_config.name}")
+        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+        jax_weights_pytorch.load_jax_weights(model, checkpoint_dir)
         return model
 
     @abc.abstractmethod

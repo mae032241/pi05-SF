@@ -7,11 +7,12 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
+import openpi.models.lora as _lora
+from openpi.models_pytorch import lora_pytorch
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
-
-from vggt.utils.load_fn import preprocess_images_from_openpi
 from vggt.heads.utils import custom_pooling
+from vggt.utils.load_fn import preprocess_images_from_openpi
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -100,6 +101,11 @@ class PI0Pytorch(nn.Module):
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
+            vision_lora_config=(
+                _lora.LoRAConfig(rank=config.vision_lora_rank, alpha=config.vision_lora_alpha)
+                if config.vision_train_mode == "lora"
+                else None
+            ),
         )
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
@@ -112,6 +118,8 @@ class PI0Pytorch(nn.Module):
             self.state_proj = nn.Linear(32, action_expert_config.width)
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+
+        lora_pytorch.configure_pi0_trainability(self, config)
 
         torch.set_float32_matmul_precision("high")
         self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
@@ -425,8 +433,8 @@ class PI0Pytorch(nn.Module):
         img_padding_mask = torch.stack(img_padding_mask, dim=1)
         target_size = img_padding_mask.shape[-1] // 14  # 224/14, where 14 is the patch size of Gemma encoder
         mask_downsampled = F.interpolate(
-            img_padding_mask.float(), 
-            size=(target_size, target_size), 
+            img_padding_mask.float(),
+            size=(target_size, target_size),
             mode='nearest'
         ).bool().flatten(start_dim=1)
         assert align_mask.shape == mask_downsampled.shape, \

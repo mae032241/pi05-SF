@@ -1,5 +1,5 @@
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import flax.nnx as nnx
 import jax
@@ -29,10 +29,18 @@ class Pi0Config(_model.BaseModelConfig):
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
     pi05: bool = False
+    # Controls how the SigLIP vision encoder is trained. "full" preserves the
+    # existing behavior; "lora" adds adapters and freezes the base vision weights.
+    vision_train_mode: Literal["full", "lora"] = "full"
+    vision_variant: str = "So400m/14"
+    vision_lora_rank: int = 16
+    vision_lora_alpha: float = 16.0
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
     def __post_init__(self):
+        if self.vision_lora_rank <= 0:
+            raise ValueError("vision_lora_rank must be positive")
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
@@ -55,6 +63,7 @@ class Pi0Config(_model.BaseModelConfig):
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+        image_padding_mask_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION], jnp.bool_)
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
@@ -68,6 +77,11 @@ class Pi0Config(_model.BaseModelConfig):
                     "left_wrist_0_rgb": image_mask_spec,
                     "right_wrist_0_rgb": image_mask_spec,
                 },
+                image_padding_mask={
+                    "base_0_rgb": image_padding_mask_spec,
+                    "left_wrist_0_rgb": image_padding_mask_spec,
+                    "right_wrist_0_rgb": image_padding_mask_spec,
+                },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
@@ -78,31 +92,26 @@ class Pi0Config(_model.BaseModelConfig):
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
         """Returns the freeze filter based on the model config."""
-        filters = []
-        has_lora = False
+        frozen_groups = []
         gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
         action_expert_params_filter = nnx_utils.PathRegex(".*llm.*_1.*")
+        non_lora_filter = nnx.Not(nnx_utils.PathRegex(".*lora.*"))
         if "lora" in self.paligemma_variant:
-            filters.append(
-                gemma_params_filter,
-            )
+            language_filter = gemma_params_filter
             if "lora" not in self.action_expert_variant:
-                # If only freeze gemma params, exclude action expert params.
-                filters.append(
+                language_filter = nnx.All(
+                    language_filter,
                     nnx.Not(action_expert_params_filter),
                 )
-            has_lora = True
+            frozen_groups.append(nnx.All(language_filter, non_lora_filter))
         elif "lora" in self.action_expert_variant:
-            filters.append(
-                action_expert_params_filter,
+            frozen_groups.append(
+                nnx.All(action_expert_params_filter, non_lora_filter),
             )
-            has_lora = True
-
-        if has_lora:
-            # If any lora is used, exclude all lora params.
-            filters.append(
-                nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+        if self.vision_train_mode == "lora":
+            frozen_groups.append(
+                nnx.All(nnx_utils.PathRegex("PaliGemma/img/.*"), non_lora_filter),
             )
-        if not filters:
+        if not frozen_groups:
             return nnx.Nothing
-        return nnx.All(*filters)
+        return nnx.Any(*frozen_groups)

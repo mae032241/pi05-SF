@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+import openpi.models.lora as lora
 import openpi.training.sharding as sharding
 
 
@@ -50,12 +51,128 @@ def get_posemb(self, typ, seqshape, width, name, dtype=jnp.float32):
     raise ValueError(f"Unknown posemb type: {typ}")
 
 
+class LoRADense(nn.Module):
+    """Dense layer with base-compatible parameter names and an optional LoRA delta."""
+
+    features: int
+    lora_config: lora.LoRAConfig | None = None
+    dtype: str = "float32"
+    kernel_init: nn.initializers.Initializer = nn.initializers.xavier_uniform()
+    bias_init: nn.initializers.Initializer = nn.initializers.normal(stddev=1e-6)
+
+    @nn.compact
+    def __call__(self, x):
+        kernel = self.param("kernel", self.kernel_init, (x.shape[-1], self.features))
+        bias = self.param("bias", self.bias_init, (self.features,))
+        y = jnp.matmul(x, kernel.astype(self.dtype)) + bias.astype(self.dtype)
+        if config := self.lora_config:
+            lora_a = self.param("lora_a", config.init_fn, (x.shape[-1], config.rank))
+            lora_b = self.param("lora_b", nn.initializers.zeros, (config.rank, self.features))
+            y += jnp.matmul(jnp.matmul(x, lora_a.astype(self.dtype)), lora_b.astype(self.dtype)) * config.scaling_value
+        return y
+
+
+class LoRAQKVProjection(nn.Module):
+    num_heads: int
+    head_dim: int
+    lora_config: lora.LoRAConfig | None = None
+    dtype: str = "float32"
+    kernel_init: nn.initializers.Initializer = nn.initializers.xavier_uniform()
+
+    @nn.compact
+    def __call__(self, x):
+        kernel_shape = (x.shape[-1], self.num_heads, self.head_dim)
+
+        def kernel_init(rng, shape, dtype=jnp.float32):
+            flat = self.kernel_init(rng, (shape[0], shape[1] * shape[2]), dtype)
+            return jnp.reshape(flat, shape)
+
+        kernel = self.param("kernel", kernel_init, kernel_shape)
+        bias = self.param("bias", nn.initializers.zeros, (self.num_heads, self.head_dim))
+        y = jnp.einsum("...d,dhq->...hq", x, kernel.astype(self.dtype)) + bias.astype(self.dtype)
+        if config := self.lora_config:
+            lora_a = self.param("lora_a", config.init_fn, (x.shape[-1], config.rank))
+            lora_b = self.param(
+                "lora_b", nn.initializers.zeros, (config.rank, self.num_heads, self.head_dim)
+            )
+            delta = jnp.einsum("...d,dl->...l", x, lora_a.astype(self.dtype))
+            y += jnp.einsum("...l,lhq->...hq", delta, lora_b.astype(self.dtype)) * config.scaling_value
+        return y
+
+
+class LoRAOutputProjection(nn.Module):
+    features: int
+    lora_config: lora.LoRAConfig | None = None
+    dtype: str = "float32"
+    kernel_init: nn.initializers.Initializer = nn.initializers.xavier_uniform()
+
+    @nn.compact
+    def __call__(self, x):
+        kernel_shape = (x.shape[-2], x.shape[-1], self.features)
+
+        def kernel_init(rng, shape, dtype=jnp.float32):
+            flat = self.kernel_init(rng, (shape[0] * shape[1], shape[2]), dtype)
+            return jnp.reshape(flat, shape)
+
+        kernel = self.param("kernel", kernel_init, kernel_shape)
+        bias = self.param("bias", nn.initializers.zeros, (self.features,))
+        y = jnp.einsum("...hd,hdo->...o", x, kernel.astype(self.dtype)) + bias.astype(self.dtype)
+        if config := self.lora_config:
+            lora_a = self.param(
+                "lora_a", config.init_fn, (x.shape[-2], x.shape[-1], config.rank)
+            )
+            lora_b = self.param("lora_b", nn.initializers.zeros, (config.rank, self.features))
+            delta = jnp.einsum("...hd,hdl->...l", x, lora_a.astype(self.dtype))
+            y += jnp.einsum("...l,lo->...o", delta, lora_b.astype(self.dtype)) * config.scaling_value
+        return y
+
+
+class LoRAMultiHeadDotProductAttention(nn.Module):
+    """SigLIP self-attention with LoRA on q/k/v/out projections."""
+
+    num_heads: int
+    lora_config: lora.LoRAConfig | None = None
+    deterministic: bool = True
+    dtype: str = "float32"
+    kernel_init: nn.initializers.Initializer = nn.initializers.xavier_uniform()
+
+    @nn.compact
+    def __call__(self, inputs_q, inputs_k=None, inputs_v=None):
+        inputs_k = inputs_q if inputs_k is None else inputs_k
+        inputs_v = inputs_k if inputs_v is None else inputs_v
+        if inputs_q.shape[-1] % self.num_heads:
+            raise ValueError(f"Embedding dimension {inputs_q.shape[-1]} is not divisible by {self.num_heads}")
+        head_dim = inputs_q.shape[-1] // self.num_heads
+        def projection(name):
+            return LoRAQKVProjection(
+                num_heads=self.num_heads,
+                head_dim=head_dim,
+                lora_config=self.lora_config,
+                dtype=self.dtype,
+                kernel_init=self.kernel_init,
+                name=name,
+            )
+
+        query = projection("query")(inputs_q)
+        key = projection("key")(inputs_k)
+        value = projection("value")(inputs_v)
+        attended = nn.dot_product_attention(query, key, value, deterministic=self.deterministic, dtype=self.dtype)
+        return LoRAOutputProjection(
+            features=inputs_q.shape[-1],
+            lora_config=self.lora_config,
+            dtype=self.dtype,
+            kernel_init=self.kernel_init,
+            name="out",
+        )(attended)
+
+
 class MlpBlock(nn.Module):
     """Transformer MLP / feed-forward block."""
 
     mlp_dim: int | None = None  # Defaults to 4x input dim
     dropout: float = 0.0
     dtype_mm: str = "float32"
+    lora_config: lora.LoRAConfig | None = None
 
     @nn.compact
     def __call__(self, x, deterministic=True):  # noqa: FBT002
@@ -66,10 +183,22 @@ class MlpBlock(nn.Module):
         }
 
         _, _, d = x.shape  # n,l,d
-        x = nn.Dense(self.mlp_dim or 4 * d, dtype=self.dtype_mm, **inits)(x)
+        x = LoRADense(
+            self.mlp_dim or 4 * d,
+            lora_config=self.lora_config,
+            dtype=self.dtype_mm,
+            name="Dense_0",
+            **inits,
+        )(x)
         x = nn.gelu(x)
         x = nn.Dropout(rate=self.dropout)(x, deterministic)
-        return nn.Dense(d, dtype=self.dtype_mm, **inits)(x)
+        return LoRADense(
+            d,
+            lora_config=self.lora_config,
+            dtype=self.dtype_mm,
+            name="Dense_1",
+            **inits,
+        )(x)
 
 
 class Encoder1DBlock(nn.Module):
@@ -79,17 +208,20 @@ class Encoder1DBlock(nn.Module):
     num_heads: int = 12
     dropout: float = 0.0
     dtype_mm: str = "float32"
+    lora_config: lora.LoRAConfig | None = None
 
     @nn.compact
     def __call__(self, x, deterministic=True):  # noqa: FBT002
         out = {}
         x = sharding.activation_sharding_constraint(x)
         y = nn.LayerNorm(dtype=self.dtype_mm)(x)
-        y = out["sa"] = nn.MultiHeadDotProductAttention(
+        y = out["sa"] = LoRAMultiHeadDotProductAttention(
             num_heads=self.num_heads,
+            lora_config=self.lora_config,
             kernel_init=nn.initializers.xavier_uniform(),
             deterministic=deterministic,
             dtype=self.dtype_mm,
+            name="MultiHeadDotProductAttention_0",
         )(y, y)
         y = sharding.activation_sharding_constraint(y)
         y = nn.Dropout(rate=self.dropout)(y, deterministic)
@@ -100,6 +232,7 @@ class Encoder1DBlock(nn.Module):
             mlp_dim=self.mlp_dim,
             dropout=self.dropout,
             dtype_mm=self.dtype_mm,
+            lora_config=self.lora_config,
         )(y, deterministic)
         y = sharding.activation_sharding_constraint(y)
         y = nn.Dropout(rate=self.dropout)(y, deterministic)
@@ -118,6 +251,7 @@ class Encoder(nn.Module):
     scan: bool = False
     remat_policy: str = "nothing_saveable"
     dtype_mm: str = "float32"
+    lora_config: lora.LoRAConfig | None = None
 
     @nn.compact
     def __call__(self, x, deterministic=True):  # noqa: FBT002
@@ -142,6 +276,7 @@ class Encoder(nn.Module):
                 mlp_dim=self.mlp_dim,
                 num_heads=self.num_heads,
                 dropout=self.dropout,
+                lora_config=self.lora_config,
             )(x, deterministic)
             for lyr in range(self.depth):
                 out[f"block{lyr:02d}"] = jax.tree.map(lambda o, lyr=lyr: o[lyr], scan_out)
@@ -154,6 +289,7 @@ class Encoder(nn.Module):
                     mlp_dim=self.mlp_dim,
                     num_heads=self.num_heads,
                     dropout=self.dropout,
+                    lora_config=self.lora_config,
                 )
                 x, out[f"block{lyr:02d}"] = block_cur(x, deterministic)
             out["pre_ln"] = x  # Alias for last block, but without the number in it.
@@ -203,6 +339,7 @@ class _Module(nn.Module):
     # or "dots_with_no_batch_dims_saveable" for more speed (memory costly)
     remat_policy: str = "nothing_saveable"
     dtype_mm: str = "float32"
+    lora_config: lora.LoRAConfig | None = None
 
     @nn.compact
     def __call__(self, image, *, train=False):
@@ -246,6 +383,7 @@ class _Module(nn.Module):
             scan=self.scan,
             remat_policy=self.remat_policy,
             dtype_mm=self.dtype_mm,
+            lora_config=self.lora_config,
             name="Transformer",
         )(x, deterministic=not train)
         encoded = out["encoded"] = x

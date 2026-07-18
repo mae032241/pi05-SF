@@ -10,6 +10,7 @@ from typing_extensions import override
 from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
+import openpi.models.lora as _lora
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
@@ -81,10 +82,15 @@ class Pi0(_model.BaseModel):
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
-                variant="So400m/14",
+                variant=config.vision_variant,
                 pool_type="none",
                 scan=True,
                 dtype_mm=config.dtype,
+                lora_config=(
+                    _lora.LoRAConfig(rank=config.vision_lora_rank, alpha=config.vision_lora_alpha)
+                    if config.vision_train_mode == "lora"
+                    else None
+                ),
             )
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)

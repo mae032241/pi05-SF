@@ -5,10 +5,13 @@ Example usage: uv run examples/aloha_real/convert_aloha_data_to_lerobot.py --raw
 """
 
 import dataclasses
+import json
 from pathlib import Path
+import re
 import shutil
 from typing import Literal
 
+import cv2
 import h5py
 from lerobot.common.constants import HF_LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
@@ -41,13 +44,6 @@ def create_empty_dataset(
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ) -> LeRobotDataset:
     motors = [
-        "right_waist",
-        "right_shoulder",
-        "right_elbow",
-        "right_forearm_roll",
-        "right_wrist_angle",
-        "right_wrist_rotate",
-        "right_gripper",
         "left_waist",
         "left_shoulder",
         "left_elbow",
@@ -55,6 +51,13 @@ def create_empty_dataset(
         "left_wrist_angle",
         "left_wrist_rotate",
         "left_gripper",
+        "right_waist",
+        "right_shoulder",
+        "right_elbow",
+        "right_forearm_roll",
+        "right_wrist_angle",
+        "right_wrist_rotate",
+        "right_gripper",
     ]
 
     features = {
@@ -144,12 +147,18 @@ def load_raw_images_per_camera(ep: h5py.File, cameras: list[str]) -> dict[str, n
             # load all images in RAM
             imgs_array = ep[f"/observations/images/{camera}"][:]
         else:
-            import cv2
-
             # load one compressed image after the other in RAM and uncompress
             imgs_array = []
             for data in ep[f"/observations/images/{camera}"]:
-                imgs_array.append(cv2.cvtColor(cv2.imdecode(data, 1), cv2.COLOR_BGR2RGB))
+                buffer = (
+                    np.asarray(data, dtype=np.uint8).reshape(-1)
+                    if isinstance(data, np.ndarray)
+                    else np.frombuffer(data, np.uint8)
+                )
+                image = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+                if image is None:
+                    raise ValueError(f"Failed to decode {camera} image in {ep.filename}")
+                imgs_array.append(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
             imgs_array = np.array(imgs_array)
 
         imgs_per_cam[camera] = imgs_array
@@ -193,11 +202,22 @@ def populate_dataset(
         imgs_per_cam, state, action, velocity, effort = load_raw_episode_data(ep_path, cameras)
         num_frames = state.shape[0]
 
+        episode_task = task
+        instructions_path = ep_path.parent / "instructions.json"
+        if instructions_path.exists():
+            with instructions_path.open("r", encoding="utf-8") as f:
+                instructions = json.load(f).get("instructions", [])
+            if isinstance(instructions, str):
+                episode_task = instructions
+            elif instructions:
+                # Pick deterministically so repeated conversions produce the same dataset.
+                episode_task = instructions[ep_idx % len(instructions)]
+
         for i in range(num_frames):
             frame = {
                 "observation.state": state[i],
                 "action": action[i],
-                "task": task,
+                "task": episode_task,
             }
 
             for camera, img_array in imgs_per_cam.items():
@@ -232,7 +252,13 @@ def port_aloha(
     if not raw_dir.exists():
         raise ValueError(f"Raw directory {raw_dir} does not exist. Please provide a valid path to the raw data.")
 
-    hdf5_files = sorted(raw_dir.glob("episode_*.hdf5"))
+    def episode_index(path: Path) -> int:
+        match = re.search(r"(\d+)$", path.stem)
+        return int(match.group(1)) if match else -1
+
+    hdf5_files = sorted(raw_dir.rglob("episode_*.hdf5"), key=episode_index)
+    if not hdf5_files:
+        raise ValueError(f"No episode_*.hdf5 files found under {raw_dir}")
 
     # Get camera names from the first episode
     cameras = get_cameras(hdf5_files)

@@ -121,7 +121,8 @@ def preprocess_observation_pytorch(
             # Save original images (with color_aug, but without rotation) for VGGT input
             img_inv_padding = image.clone() if not (image == 0).all() else torch.ones_like(image)
             img_inv_padding[~observation.image_padding_mask[key]] = 1.0  # Set padding areas to white
-            img_inv_padding = img_inv_padding.permute(0, 3, 1, 2) if is_channels_first else img_inv_padding
+            # VGGT and Hugging Face vision towers both consume NCHW.
+            img_inv_padding = img_inv_padding.permute(0, 3, 1, 2)
             out_images_wo_aug[key] = img_inv_padding.contiguous()
 
             # Color augmentations for all cameras
@@ -149,11 +150,9 @@ def preprocess_observation_pytorch(
             # Back to [-1, 1]
             image = image * 2.0 - 1.0
 
-        # Convert back to [B, C, H, W] format if it was originally channels-first
-        if is_channels_first:
-            image = image.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
-
-        out_images[key] = image
+        # The Torch SigLIP patch embedding always expects [B, C, H, W], even
+        # when Policy/LeRobot supplied the public OpenPI HWC representation.
+        out_images[key] = image.permute(0, 3, 1, 2).contiguous()
 
     # obtain mask
     out_masks = {}
@@ -163,9 +162,9 @@ def preprocess_observation_pytorch(
             out_masks[key] = torch.ones(batch_shape, dtype=torch.bool, device=observation.state.device)
         else:
             out_masks[key] = observation.image_masks[key]
-  
+
     # obtain image padding mask for non-rectangular images
-    img_padding_mask = {key: observation.image_padding_mask[key] for key in out_images}       
+    img_padding_mask = {key: observation.image_padding_mask[key] for key in out_images}
 
     # Create a simple object with the required attributes instead of using the complex Observation class
     class SimpleProcessedObservation:

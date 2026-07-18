@@ -107,3 +107,6 @@ You need to write your client script according to your robot. A simple [client e
 ```bash
 uv run examples/simple_client/main.py --env ALOHA
 ```
+
+For adapter-only JAX/PyTorch checkpoints and vision `lora`/`full` training modes, see
+[docs/lora_checkpoints.md](docs/lora_checkpoints.md).
